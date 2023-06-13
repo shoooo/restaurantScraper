@@ -3,16 +3,13 @@ const puppeteer = require("puppeteer");
 const express = require('express');
 const app = express();
 const { GoogleSpreadsheet } = require('google-spreadsheet');
-const fs = require('fs');
+const { searchKeywords } = require("./api/gpt");
+
 // The credentials are for OAuth2 from Google
 const credentials = require('./credentials.json');
 require('dotenv').config();
 
-// 2. Defining a scraping function. I put all functions in here because they are not so long.
-const scrape = async () => {
-
-    // 3. Configuring Chrome options:
-    // If you want to see code excuted on browser, set headless false
+const scrapeEmail = async () => {
     const chromeOptions = {
         headless: true,
         defaultViewport: null,
@@ -24,86 +21,90 @@ const scrape = async () => {
         ],
     };
 
-    // 4. Launching Puppeteer:
-    // Launches a new instance of Chrome using Puppeteer and creates a new page. 
-    // `fs` module reads the content of the `count.txt` file which contains an ID number of a page to scrape.
     const browser = await puppeteer.launch(chromeOptions);
     const page = await browser.newPage()
-    const file = fs.readFileSync("count.txt").toString();
 
-    // 5. Authenticating Google Sheets API:
     const doc = new GoogleSpreadsheet(process.env.SPREADSHEET_ID);
     await doc.useServiceAccountAuth(credentials);
     await doc.loadInfo();
     const emailSheet = await doc.sheetsById[process.env.LIST_ID];
+    const rows = await emailSheet.getRows();
 
-    await page.goto(`https://tabelog.com/rstLst/${file}/?LstCos=5`)
+    // Set a limit for the number of attempts
+    const maxAttempts = 5;
+    let attempt = 0;
 
-    // 6. Extracting data from the website:
-    const list = await page.evaluate(() => {
-        let results = [];
-        let items = document.querySelectorAll('.list-rst__rst-name-target')
+    for (const row of rows) {
+        // if (attempt >= maxAttempts) {
+        //     console.log('Maximum attempts reached. Exiting the loop.');
+        //     break;
+        // }
 
-        items.forEach(async (item) => {
-            results.push({
-                name: item.innerHTML,
-                url: item.href,
-            })
-        })
-
-        return results
-    })
-
-    const restaurants = [];
-
-    for (let i = 0; i < list.length; i++) {
         try {
-            await page.goto(`${list[i].url}`);
+            const brandname = row['brandname'];
 
-            const restaurant = {};
-            const name = await page.$eval('.rstdtl-crumb', name => name.innerHTML)
-            const webURL = await page.evaluate(() => (document.querySelector('.homepage > a') ?? {}).href) ?? null;
-            const instaURL = await page.evaluate(() => (document.querySelector('.rstinfo-sns-instagram') ?? {}).href) ?? null;
-            const fbURL = await page.evaluate(() => (document.querySelector('.rstinfo-sns-facebook') ?? {}).href) ?? null;
+            await page.goto(`https://www.google.com/search?q=${encodeURIComponent(brandname)}`);
+            await page.waitForSelector('#search');
+            const websiteURL = await page.$eval('#search a', (element) => element.href);
 
-            Object.assign(restaurant, { name, webURL, instaURL, fbURL });
+            const navigationPromise = page.waitForNavigation(); // Add this line
+            await Promise.all([
+                page.click('#search a'), // Click on the link
+                navigationPromise, // Wait for navigation to complete
+            ]);
 
-            if (fbURL) {
-                await page.goto(`${fbURL}`);
+            await page.waitForTimeout(3500); // Adjust the delay as needed
 
-                const email = await page.evaluate(() => (document.querySelector('body')?.innerText.match(/(.+)@(.+){2,}\.(.+){2,}/) ?? null));
-                restaurant.email = email != null ? email[0] : null;
+            const keywords = ['特定商取引', 'プライバシーポリシー', 'お問い合わせ'];
+
+            let matchingLink = null;
+            for (const keyword of keywords) {
+                try {
+                    matchingLink = await page.evaluate((keyword) => {
+                        const links = Array.from(document.querySelectorAll('a'));
+                        const foundLink = links.find((link) => link.innerText.toLowerCase().includes(keyword));
+                        return foundLink ? foundLink.href : null;
+                    }, keyword.toLowerCase());
+
+                    if (matchingLink) {
+                        await page.goto(`${matchingLink}`)
+                        const email = await page.evaluate(() => (document.querySelector('body')?.innerText.match(/(.+)@(.+){2,}\.(.+){2,}/) ?? null));
+                        console.log(matchingLink)
+                        row['checked page'] = matchingLink;
+                        if (email != null) row['email'] = email[0];
+                        break;
+                    }
+                } catch (error) {
+                    console.log('An error occurred while evaluating the page:', error);
+                }
             }
 
-            console.log(restaurant)
-            restaurants.push(restaurant);
-        } catch { }
+            row['website'] = websiteURL;
+
+        } catch (e) { console.log(e) }
+
+        // const fbURL = await page.evaluate(() => (document.querySelector('.rstinfo-sns-facebook') ?? {}).href) ?? null;
+        // if (fbURL) {
+        //     await page.goto(`${fbURL}`);
+
+        //     const email = await page.evaluate(() => (document.querySelector('body')?.innerText.match(/(.+)@(.+){2,}\.(.+){2,}/) ?? null));
+        //     restaurant.email = email != null ? email[0] : null;
+        // }
+
+        // Update the spreadsheet with the website URL and additional info
+
+        await row.save(); // Save the updated row
+        attempt++;
     }
-
-    // Im having issues add rows to the spreadsheet. Probably because of permissions? Or wrong indexes?
-    await emailSheet.addRows(restaurants, (err, row) => {
-        console.log(err || row)
-    });
-
-    const count = parseInt(file)
-    const inc = count + 1
-    fs.writeFileSync('./count.txt', inc.toString());
-
     await browser.close()
 
-    if (file < 30) {
-        scrape()
-    }
+    // await emailSheet.addRows(list, (err, row) => {
+    //     console.log(err || row)
+    // });
+
 }
 
-scrape()
-
-// for (let i = 0; i < 2; i++) {
-//     setTimeout(()=>{
-//         scrape();
-//      }, 10000); // multiple i by 1000
-//   }
-
+scrapeEmail()
 
 const PORT = process.env.PORT || 1000;
 
